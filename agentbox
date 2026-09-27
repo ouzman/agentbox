@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# agentbox: run coding agents in throwaway containers with a dind sidecar.
+#
+#   agentbox claude|pi|cursor-agent [agent args...]
+#   agentbox build        # (re)build the base image
+#   AGENTBOX_UPDATE=1 agentbox claude   # force an agent update now
+#
+# Busybox-style: invoked as bclaude/bpi/bcursor-agent (symlinks to this file) it
+# behaves like `agentbox claude|pi|cursor-agent`; a leading `-n name` is still
+# taken as the session name (`bclaude -n foo` == `agentbox -n foo claude`).
+#
+# Agents live in Docker volumes (agentbox-local, agentbox-npm), not in the image.
+# Installed on first use (foreground), then updated in the background at most
+# once per 24h; updates take effect from the next session.
+# ---------------------------------------------------------------------------
+
+case "${0##*/}" in
+  bclaude)       implied=claude ;;
+  bpi)           implied=pi ;;
+  bcursor-agent) implied=cursor-agent ;;
+  *)             implied= ;;
+esac
+if [ -n "$implied" ]; then
+  if [ "$1" = -n ] && [ $# -ge 2 ]; then
+    set -- -n "$2" "$implied" "${@:3}"
+  else
+    set -- "$implied" "$@"
+  fi
+fi
+
+image="${AGENTBOX_IMAGE:-agentbox}"
+ab="$HOME/.agentbox"
+
+# Claude Code statusline, installed as /usr/local/bin/agentbox-statusline.
+# Line 1: ccusage (extra args are passed to it). Line 2: git project, branch,
+# linked worktree (if any), then the agentbox session name (as in PS1).
+statusline=$(cat <<'STATUSLINE'
+#!/bin/sh
+in=$(cat)
+printf '%s\n' "$(printf '%s' "$in" | ccusage statusline "$@")"
+dir=$(printf '%s' "$in" | sed -n 's/.*"current_dir": *"\([^"]*\)".*/\1/p' | head -n 1)
+line=
+if top=$(git -C "${dir:-.}" rev-parse --show-toplevel 2>/dev/null); then
+  common=$(git -C "$top" rev-parse --path-format=absolute --git-common-dir)
+  project=${common%/.git}; project=${project##*/}
+  branch=$(git -C "$top" branch --show-current)
+  [ -n "$branch" ] || branch=$(git -C "$top" rev-parse --short HEAD)
+  line="📁 $project | 🌿 $branch"
+  [ "$(git -C "$top" rev-parse --absolute-git-dir)" = "$common" ] \
+    || line="$line | 🌳 ${top##*/}"
+fi
+[ -n "$AB_SESSION" ] && line="${line:+$line | }$(printf '\033[33m[%s]\033[0m' "$AB_SESSION")"
+[ -z "$line" ] || printf '%s\n' "$line"
+STATUSLINE
+)
+
+_agentbox_build() {
+  docker build -t "$image" \
+    --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" \
+    --build-arg STATUSLINE="$statusline" - <<'DOCKERFILE'
+FROM node:22-bookworm-slim
+ARG UID=1000
+ARG GID=1000
+RUN userdel -r node 2>/dev/null || true; groupdel node 2>/dev/null || true; \
+    apt-get update && apt-get install -y --no-install-recommends \
+      git curl ca-certificates sudo ripgrep bash less procps ncurses-term \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd -o -g "$GID" dev \
+ && useradd -o -m -u "$UID" -g "$GID" -s /bin/bash dev \
+ && echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
+COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
+# ccusage (statusline) goes in the image under /usr/local, not ~/.npm-global:
+# that path is the agentbox-npm volume, which would hide anything baked in.
+# Running it once as root lets its wrapper chmod the native binary, which it
+# otherwise tries (and fails, EPERM) on first run as dev.
+RUN npm i -g ccusage && npm cache clean --force && ccusage --version
+ARG STATUSLINE
+RUN printf '%s\n' "$STATUSLINE" > /usr/local/bin/agentbox-statusline \
+ && chmod +x /usr/local/bin/agentbox-statusline
+USER dev
+WORKDIR /home/dev
+ENV PATH=/home/dev/.local/bin:/home/dev/.npm-global/bin:$PATH \
+    NPM_CONFIG_PREFIX=/home/dev/.npm-global
+RUN mkdir -p ~/.claude ~/.pi ~/.cursor ~/.config/cursor ~/.npm-global ~/.local/bin \
+ && echo '[ -n "$AB_SESSION" ] && PS1="\\[\\e[33m\\][$AB_SESSION]\\[\\e[0m\\] $PS1"' >> ~/.bashrc
+DOCKERFILE
+}
+
+name=""
+if [ "$1" = -n ]; then name="$2"; shift 2 || exit 1; fi
+
+tool="$1"
+[ -n "$tool" ] || { echo "usage: agentbox [-n name] claude|pi|cursor-agent [args...] | build | ls | shell [name] [cmd...]" >&2; exit 1; }
+shift
+
+if [ "$tool" = build ]; then _agentbox_build; exit $?; fi
+
+if [ "$tool" = ls ]; then
+  docker ps --filter label=agentbox.tool \
+    --format 'table {{.Names}}\t{{.Label "agentbox.tool"}}\t{{.Label "agentbox.branch"}}\t{{.RunningFor}}\t{{.Label "agentbox.dir"}}'
+  exit $?
+fi
+
+if [ "$tool" = shell ]; then
+  # agentbox shell [name] [cmd...]  — no name: the session running in $PWD
+  target="$1"; [ $# -gt 0 ] && shift
+  if [ -z "$target" ]; then
+    names=$(docker ps --filter "label=agentbox.dir=$PWD" --format '{{.Names}}')
+    n=$(printf '%s\n' "$names" | grep -c .)
+    if [ "$n" -eq 0 ]; then
+      echo "agentbox: no session in $PWD (see: agentbox ls)" >&2; exit 1
+    elif [ "$n" -gt 1 ]; then
+      if command -v fzf >/dev/null 2>&1; then
+        target=$(printf '%s\n' "$names" | fzf --prompt='session> ') || exit 1
+      else
+        echo "agentbox: multiple sessions here, pick one:" >&2
+        printf '%s\n' "$names" | sed 's/^/  /' >&2; exit 1
+      fi
+    else
+      target="$names"
+    fi
+  fi
+  dir=$(docker inspect -f '{{index .Config.Labels "agentbox.dir"}}' "$target") || exit 1
+  [ $# -gt 0 ] || set -- bash
+  docker exec -it -e TERM="${TERM:-xterm-256color}" -e COLORTERM="${COLORTERM:-}" \
+    -w "$dir" "$target" "$@"
+  exit $?
+fi
+docker image inspect "$image" >/dev/null 2>&1 || _agentbox_build || exit 1
+
+# never mount $HOME (or anything above it): that would expose ~/.ssh, ~/.aws, ...
+case "$HOME/" in "$PWD"/*)
+  echo "agentbox: refusing to run in $PWD (it contains your home directory); cd into a project first" >&2
+  exit 1 ;;
+esac
+[ "$PWD" = / ] && { echo "agentbox: refusing to run in /" >&2; exit 1; }
+
+case "$tool" in
+  claude)
+    mkdir -p "$ab/claude"
+    agent_mounts=(-v "$ab/claude:/home/dev/.claude" -e CLAUDE_CONFIG_DIR=/home/dev/.claude)
+    cmd=(claude) ;;
+  pi)
+    mkdir -p "$ab/pi"
+    agent_mounts=(-v "$ab/pi:/home/dev/.pi")
+    cmd=(pi) ;;
+  cursor-agent)
+    mkdir -p "$ab/cursor" "$ab/cursor-auth"
+    agent_mounts=(-v "$ab/cursor:/home/dev/.cursor" -v "$ab/cursor-auth:/home/dev/.config/cursor")
+    cmd=(cursor-agent) ;;
+  *) echo "agentbox: unknown tool '$tool'" >&2; exit 1 ;;
+esac
+
+git_mounts=()
+[ -f "$HOME/.gitconfig" ] && git_mounts+=(-v "$HOME/.gitconfig:/home/dev/.gitconfig:ro")
+[ -f .git/config ]        && git_mounts+=(-v "$PWD/.git/config:$PWD/.git/config:ro")
+[ -d .git/hooks ]         && git_mounts+=(-v "$PWD/.git/hooks:$PWD/.git/hooks:ro")
+
+base=$(printf %s "${PWD##*/}" | tr -c 'a-zA-Z0-9_.-' '-')
+if [ -n "$name" ]; then
+  sid="ab-$base-$(printf %s "$name" | tr -c 'a-zA-Z0-9_.-' '-')"
+else
+  sid="ab-$base-$RANDOM"
+fi
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo -)
+printf '\033]0;%s\007' "$sid"   # terminal tab title
+trap 'docker rm -f "$sid-dind" >/dev/null 2>&1; docker network rm "$sid" >/dev/null 2>&1' EXIT INT TERM
+
+# one-time, visible pull; otherwise the background start would pull silently
+docker image inspect docker:dind >/dev/null 2>&1 || docker pull docker:dind || exit 1
+
+docker network create "$sid" >/dev/null || exit 1
+# Started in the foreground on purpose: a backgrounded docker/podman client
+# sharing the terminal caused the agent to be stopped (SIGTTOU/SIGTTIN).
+# dockerd itself still boots in parallel with the agent; we don't wait for it.
+docker run -d --rm --privileged --name "$sid-dind" --network "$sid" \
+  -e DOCKER_TLS_CERTDIR= -v "$PWD:$PWD" docker:dind >/dev/null </dev/null || exit 1
+
+
+# Runs inside the container: install/update the agent, then exec it.
+boot='
+    infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
+    state="$HOME/.local/state/agentbox"; mkdir -p "$state"
+    stamp="$state/$AB_TOOL.updated"; log="$state/$AB_TOOL.log"
+    ab_update() {
+      case "$AB_TOOL" in
+        claude) { command -v claude >/dev/null && claude update; } \
+                  || curl -fsSL https://claude.ai/install.sh | bash ;;
+        cursor-agent) curl -fsSL https://cursor.com/install | bash ;;
+        pi)     npm i -g @mariozechner/pi-coding-agent@latest ;;
+      esac && touch "$stamp"
+    }
+    if ! command -v "$1" >/dev/null 2>&1 || [ -n "$AB_FORCE" ]; then
+      echo "agentbox: installing/updating $AB_TOOL..." >&2
+      ab_update || echo "agentbox: update failed" >&2
+    elif [ -z "$(find "$stamp" -mmin -1440 2>/dev/null)" ]; then
+      # stale: update in background, takes effect next session
+      ( ab_update ) >"$log" 2>&1 &
+    fi
+    exec "$@"'
+
+docker run --rm -it --network "$sid" --name "$sid" \
+  --label agentbox.tool="$tool" --label agentbox.dir="$PWD" --label agentbox.branch="$branch" \
+  -e AB_SESSION="$sid" \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD:$PWD" -w "$PWD" \
+  -e HOME=/home/dev \
+  -e TERM="${TERM:-xterm-256color}" -e COLORTERM="${COLORTERM:-}" \
+  -e TERM_PROGRAM="${TERM_PROGRAM:-}" -e TERM_PROGRAM_VERSION="${TERM_PROGRAM_VERSION:-}" \
+  -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 \
+  -e DOCKER_HOST="tcp://$sid-dind:2375" \
+  -e TESTCONTAINERS_HOST_OVERRIDE="$sid-dind" \
+  -e AB_TOOL="$tool" -e AB_FORCE="${AGENTBOX_UPDATE:-}" \
+  -v agentbox-local:/home/dev/.local \
+  -v agentbox-npm:/home/dev/.npm-global \
+  -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=commit.gpgsign -e GIT_CONFIG_VALUE_0=false \
+  "${git_mounts[@]}" "${agent_mounts[@]}" \
+  "$image" bash -c "$boot" _ "${cmd[@]}" "$@"
