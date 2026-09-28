@@ -97,11 +97,30 @@ shift
 if [ "$tool" = build ]; then _agentbox_build; exit $?; fi
 
 if [ "$tool" = ls ]; then
+  # "2026-09-28T19:41:15.017Z" -> "5 minutes ago"; GNU date, then BSD (macOS)
+  # date; anything unparseable is shown as is.
+  ago() {
+    t=${1%%.*}; t=${t%Z}
+    s=$(date -u -d "$t" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%S' "$t" +%s 2>/dev/null) \
+      || { printf '%s' "$1"; return; }
+    d=$(( $(date +%s) - s ))
+    if   [ $d -lt 60 ];    then n=$d;             u=second
+    elif [ $d -lt 3600 ];  then n=$((d / 60));    u=minute
+    elif [ $d -lt 86400 ]; then n=$((d / 3600));  u=hour
+    else                        n=$((d / 86400)); u=day
+    fi
+    [ $n -eq 1 ] || u=${u}s
+    printf '%s %s ago' "$n" "$u"
+  }
+  tab=$(printf '\t')
   ids=$(docker ps -q --filter label=agentbox.tool) || exit 1
   {
     printf 'NAME\tTOOL\tBRANCH\tSTARTED\tDIR\n'
-    [ -z "$ids" ] || docker inspect -f '{{.Name}}{{"\t"}}{{index .Config.Labels "agentbox.tool"}}{{"\t"}}{{index .Config.Labels "agentbox.branch"}}{{"\t"}}{{.State.StartedAt}}{{"\t"}}{{index .Config.Labels "agentbox.dir"}}' $ids | sed 's|^/||'
-  } | column -t -s "$(printf '\t')"
+    [ -z "$ids" ] || docker inspect -f '{{.Name}}{{"\t"}}{{index .Config.Labels "agentbox.tool"}}{{"\t"}}{{index .Config.Labels "agentbox.branch"}}{{"\t"}}{{.State.StartedAt}}{{"\t"}}{{index .Config.Labels "agentbox.dir"}}' $ids |
+      while IFS=$tab read -r cname ctool cbranch cstarted cdir; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "${cname#/}" "$ctool" "$cbranch" "$(ago "$cstarted")" "$cdir"
+      done
+  } | column -t -s "$tab"
   exit 0
 fi
 
