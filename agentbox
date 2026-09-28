@@ -3,7 +3,7 @@
 # agentbox: run coding agents in throwaway containers with a dind sidecar.
 #
 #   agentbox claude|pi|cursor-agent [agent args...]
-#   agentbox build        # (re)build the base image
+#   agentbox build        # force a rebuild (stale images rebuild on their own)
 #   AGENTBOX_UPDATE=1 agentbox claude   # force an agent update now
 #
 # Busybox-style: invoked as bclaude/bpi/bcursor-agent (symlinks to this file) it
@@ -55,10 +55,7 @@ fi
 STATUSLINE
 )
 
-_agentbox_build() {
-  docker build -t "$image" \
-    --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" \
-    --build-arg STATUSLINE="$statusline" - <<'DOCKERFILE'
+dockerfile=$(cat <<'DOCKERFILE'
 FROM node:22-bookworm-slim
 ARG UID=1000
 ARG GID=1000
@@ -85,6 +82,17 @@ ENV PATH=/home/dev/.local/bin:/home/dev/.npm-global/bin:$PATH \
 RUN mkdir -p ~/.claude ~/.pi ~/.cursor ~/.config/cursor ~/.npm-global ~/.local/bin \
  && echo '[ -n "$AB_SESSION" ] && PS1="\\[\\e[33m\\][$AB_SESSION]\\[\\e[0m\\] $PS1"' >> ~/.bashrc
 DOCKERFILE
+)
+
+# Fingerprint of everything the build depends on, stored as an image label so a
+# stale image (e.g. after `brew upgrade agentbox`) is rebuilt automatically.
+build_id=$(printf '%s\n' "$dockerfile" "$(id -u)" "$(id -g)" "$statusline" | cksum | cut -d' ' -f1)
+
+_agentbox_build() {
+  printf '%s\n' "$dockerfile" | docker build -t "$image" \
+    --label agentbox.build="$build_id" \
+    --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" \
+    --build-arg STATUSLINE="$statusline" -
 }
 
 name=""
@@ -149,7 +157,14 @@ if [ "$tool" = shell ]; then
     -w "$dir" "$target" "$@"
   exit $?
 fi
-docker image inspect "$image" >/dev/null 2>&1 || _agentbox_build || exit 1
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  _agentbox_build || exit 1
+elif [ -z "${AGENTBOX_IMAGE:-}" ] &&
+     [ "$(docker image inspect -f '{{index .Config.Labels "agentbox.build"}}' "$image")" != "$build_id" ]; then
+  # only the default image: a custom AGENTBOX_IMAGE may not be ours to rebuild
+  echo "agentbox: image is out of date, rebuilding..." >&2
+  _agentbox_build || exit 1
+fi
 
 # never mount $HOME (or anything above it): that would expose ~/.ssh, ~/.aws, ...
 case "$HOME/" in "$PWD"/*)

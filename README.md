@@ -17,12 +17,17 @@ bash and a `docker` CLI (Docker Desktop, colima, podman-docker, ...).
 
 ```sh
 agentbox [-n name] claude|pi|cursor-agent [agent args...]
-agentbox build                 # (re)build the base image
+agentbox build                 # force a rebuild of the base image
 agentbox ls                    # list running sessions
 agentbox shell [name] [cmd...] # shell into a session (default: the one in $PWD)
 AGENTBOX_UPDATE=1 agentbox claude   # force an agent update now
 AGENTBOX_IMAGE=myimage agentbox pi  # use a different image tag
 ```
+
+The base image is built on first use and rebuilt automatically when its
+definition changes (e.g. after `brew upgrade agentbox`). Running sessions keep
+the image they started with. A custom `AGENTBOX_IMAGE` is only built if missing,
+never rebuilt.
 
 Shortcuts (symlinks to `agentbox`, busybox-style):
 
