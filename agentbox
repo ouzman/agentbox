@@ -97,9 +97,12 @@ shift
 if [ "$tool" = build ]; then _agentbox_build; exit $?; fi
 
 if [ "$tool" = ls ]; then
-  docker ps --filter label=agentbox.tool \
-    --format 'table {{.Names}}\t{{.Label "agentbox.tool"}}\t{{.Label "agentbox.branch"}}\t{{.RunningFor}}\t{{.Label "agentbox.dir"}}'
-  exit $?
+  ids=$(docker ps -q --filter label=agentbox.tool) || exit 1
+  {
+    printf 'NAME\tTOOL\tBRANCH\tSTARTED\tDIR\n'
+    [ -z "$ids" ] || docker inspect -f '{{.Name}}{{"\t"}}{{index .Config.Labels "agentbox.tool"}}{{"\t"}}{{index .Config.Labels "agentbox.branch"}}{{"\t"}}{{.State.StartedAt}}{{"\t"}}{{index .Config.Labels "agentbox.dir"}}' $ids | sed 's|^/||'
+  } | column -t -s "$(printf '\t')"
+  exit 0
 fi
 
 if [ "$tool" = shell ]; then
