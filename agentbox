@@ -3,7 +3,8 @@
 # agentbox: run coding agents in throwaway containers with a dind sidecar.
 #
 #   agentbox claude|pi|cursor-agent [agent args...]
-#   agentbox build        # force a rebuild (stale images rebuild on their own)
+#   agentbox build [docker build args...]  # force a rebuild (stale images rebuild on their own)
+#   agentbox dockerfile   # print the image's Dockerfile
 #   AGENTBOX_UPDATE=1 agentbox claude   # force an agent update now
 #
 # Busybox-style: invoked as bclaude/bpi/bcursor-agent (symlinks to this file) it
@@ -55,6 +56,38 @@ fi
 STATUSLINE
 )
 
+# Installed as /usr/local/bin/agentbox-boot; the entrypoint of every session:
+# install/update the agent ($AB_TOOL), then exec the given command (if any).
+boot=$(cat <<'BOOT'
+#!/bin/bash
+infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
+state="$HOME/.local/state/agentbox"; mkdir -p "$state"
+stamp="$state/$AB_TOOL.updated"; log="$state/$AB_TOOL.log"
+ab_update() {
+  case "$AB_TOOL" in
+    claude) { command -v claude >/dev/null && claude update; } \
+              || curl -fsSL https://claude.ai/install.sh | bash ;;
+    cursor-agent) curl -fsSL https://cursor.com/install | bash ;;
+    # pi moved to @earendil-works; the old package owns the same `pi` bin
+    # (EEXIST), so drop it first if an older install left it behind.
+    pi)     { [ ! -d "$(npm root -g)/@mariozechner/pi-coding-agent" ] \
+                || npm rm -g @mariozechner/pi-coding-agent; } \
+              && npm i -g @earendil-works/pi-coding-agent@latest ;;
+    *) echo "agentbox-boot: unknown AB_TOOL '$AB_TOOL'" >&2; return 1 ;;
+  esac && touch "$stamp"
+}
+# AB_TOOL is also the agent's binary name
+if ! command -v "$AB_TOOL" >/dev/null 2>&1 || [ -n "$AB_FORCE" ]; then
+  echo "agentbox: installing/updating $AB_TOOL..." >&2
+  ab_update || echo "agentbox: update failed" >&2
+elif [ -z "$(find "$stamp" -mmin -1440 2>/dev/null)" ]; then
+  # stale: update in background, takes effect next session
+  ( ab_update ) >"$log" 2>&1 &
+fi
+[ $# -eq 0 ] || exec "$@"
+BOOT
+)
+
 dockerfile=$(cat <<'DOCKERFILE'
 FROM node:22-bookworm-slim
 ARG UID=1000
@@ -73,8 +106,10 @@ COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
 # otherwise tries (and fails, EPERM) on first run as dev.
 RUN npm i -g ccusage && npm cache clean --force && ccusage --version
 ARG STATUSLINE
+ARG BOOT
 RUN printf '%s\n' "$STATUSLINE" > /usr/local/bin/agentbox-statusline \
- && chmod +x /usr/local/bin/agentbox-statusline
+ && printf '%s\n' "$BOOT" > /usr/local/bin/agentbox-boot \
+ && chmod +x /usr/local/bin/agentbox-statusline /usr/local/bin/agentbox-boot
 USER dev
 WORKDIR /home/dev
 ENV PATH=/home/dev/.local/bin:/home/dev/.npm-global/bin:$PATH \
@@ -86,23 +121,27 @@ DOCKERFILE
 
 # Fingerprint of everything the build depends on, stored as an image label so a
 # stale image (e.g. after `brew upgrade agentbox`) is rebuilt automatically.
-build_id=$(printf '%s\n' "$dockerfile" "$(id -u)" "$(id -g)" "$statusline" | cksum | cut -d' ' -f1)
+# AGENTBOX_UID/AGENTBOX_GID override the host's IDs (the published image: 1000).
+uid=${AGENTBOX_UID:-$(id -u)} gid=${AGENTBOX_GID:-$(id -g)}
+build_id=$(printf '%s\n' "$dockerfile" "$uid" "$gid" "$statusline" "$boot" | cksum | cut -d' ' -f1)
 
+# Extra args go to `docker build` (e.g. CI: --platform ... --push).
 _agentbox_build() {
   printf '%s\n' "$dockerfile" | docker build -t "$image" \
     --label agentbox.build="$build_id" \
-    --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" \
-    --build-arg STATUSLINE="$statusline" -
+    --build-arg UID="$uid" --build-arg GID="$gid" \
+    --build-arg STATUSLINE="$statusline" --build-arg BOOT="$boot" "$@" -
 }
 
 name=""
 if [ "$1" = -n ]; then name="$2"; shift 2 || exit 1; fi
 
 tool="$1"
-[ -n "$tool" ] || { echo "usage: agentbox [-n name] claude|pi|cursor-agent [args...] | build | ls | shell [name] [cmd...]" >&2; exit 1; }
+[ -n "$tool" ] || { echo "usage: agentbox [-n name] claude|pi|cursor-agent [args...] | build [docker build args...] | dockerfile | ls | shell [name] [cmd...]" >&2; exit 1; }
 shift
 
-if [ "$tool" = build ]; then _agentbox_build; exit $?; fi
+if [ "$tool" = build ]; then _agentbox_build "$@"; exit $?; fi
+if [ "$tool" = dockerfile ]; then printf '%s\n' "$dockerfile"; exit 0; fi
 
 if [ "$tool" = ls ]; then
   # "2026-09-28T19:41:15.017Z" -> "5 minutes ago"; GNU date, then BSD (macOS)
@@ -215,32 +254,6 @@ docker run -d --rm --privileged --name "$sid-dind" --network "$sid" \
   -e DOCKER_TLS_CERTDIR= -v "$PWD:$PWD" docker:dind >/dev/null </dev/null || exit 1
 
 
-# Runs inside the container: install/update the agent, then exec it.
-boot='
-    infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
-    state="$HOME/.local/state/agentbox"; mkdir -p "$state"
-    stamp="$state/$AB_TOOL.updated"; log="$state/$AB_TOOL.log"
-    ab_update() {
-      case "$AB_TOOL" in
-        claude) { command -v claude >/dev/null && claude update; } \
-                  || curl -fsSL https://claude.ai/install.sh | bash ;;
-        cursor-agent) curl -fsSL https://cursor.com/install | bash ;;
-        # pi moved to @earendil-works; the old package owns the same `pi` bin
-        # (EEXIST), so drop it first if an older install left it behind.
-        pi)     { [ ! -d "$(npm root -g)/@mariozechner/pi-coding-agent" ] \
-                    || npm rm -g @mariozechner/pi-coding-agent; } \
-                  && npm i -g @earendil-works/pi-coding-agent@latest ;;
-      esac && touch "$stamp"
-    }
-    if ! command -v "$1" >/dev/null 2>&1 || [ -n "$AB_FORCE" ]; then
-      echo "agentbox: installing/updating $AB_TOOL..." >&2
-      ab_update || echo "agentbox: update failed" >&2
-    elif [ -z "$(find "$stamp" -mmin -1440 2>/dev/null)" ]; then
-      # stale: update in background, takes effect next session
-      ( ab_update ) >"$log" 2>&1 &
-    fi
-    exec "$@"'
-
 docker run --rm -it --network "$sid" --name "$sid" \
   --label agentbox.tool="$tool" --label agentbox.dir="$PWD" --label agentbox.branch="$branch" \
   -e AB_SESSION="$sid" \
@@ -257,4 +270,4 @@ docker run --rm -it --network "$sid" --name "$sid" \
   -v agentbox-npm:/home/dev/.npm-global \
   -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=commit.gpgsign -e GIT_CONFIG_VALUE_0=false \
   "${git_mounts[@]}" "${agent_mounts[@]}" \
-  "$image" bash -c "$boot" _ "${cmd[@]}" "$@"
+  "$image" agentbox-boot "${cmd[@]}" "$@"

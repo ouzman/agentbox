@@ -18,6 +18,7 @@ bash and a `docker` CLI (Docker Desktop, colima, podman-docker, ...).
 ```sh
 agentbox [-n name] claude|pi|cursor-agent [agent args...]
 agentbox build                 # force a rebuild of the base image
+agentbox dockerfile            # print the base image's Dockerfile
 agentbox ls                    # list running sessions
 agentbox shell [name] [cmd...] # shell into a session (default: the one in $PWD)
 AGENTBOX_UPDATE=1 agentbox claude   # force an agent update now
@@ -57,3 +58,21 @@ to `~/.agentbox/claude/settings.json` (extra args go to `ccusage statusline`):
 ```json
 "statusLine": { "type": "command", "command": "agentbox-statusline", "padding": 0 }
 ```
+
+## Published image
+
+Tagging a release (`v*`) publishes the base image as
+`ghcr.io/ouzman/agentbox:<tag>` (linux/amd64 + linux/arm64, user `dev` with
+UID/GID 1000) for tools built on top of it, such as agentbox-k8s. It is the
+same image `agentbox build` makes; `agentbox build` passes extra arguments to
+`docker build`, and `AGENTBOX_UID`/`AGENTBOX_GID` override the host's IDs:
+
+```sh
+AGENTBOX_IMAGE=ghcr.io/ouzman/agentbox:v0.1.0 AGENTBOX_UID=1000 AGENTBOX_GID=1000 \
+  agentbox build --platform linux/amd64,linux/arm64 --push
+```
+
+Every session starts through `/usr/local/bin/agentbox-boot` (baked into the
+image): it installs or updates the agent named by `$AB_TOOL`, then execs its
+arguments. A custom `AGENTBOX_IMAGE` built by an older agentbox lacks it;
+rebuild it with `agentbox build`.
