@@ -100,6 +100,8 @@ RUN userdel -r node 2>/dev/null || true; groupdel node 2>/dev/null || true; \
  && useradd -o -m -u "$UID" -g "$GID" -s /bin/bash dev \
  && echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
 COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
+# buildx (BuildKit: RUN --mount, multi-platform) and compose, as plugins
+COPY --from=docker:cli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
 # ccusage (statusline) goes in the image under /usr/local, not ~/.npm-global:
 # that path is the agentbox-npm volume, which would hide anything baked in.
 # Running it once as root lets its wrapper chmod the native binary, which it
