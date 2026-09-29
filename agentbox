@@ -33,10 +33,18 @@ fi
 image="${AGENTBOX_IMAGE:-agentbox}"
 ab="$HOME/.agentbox"
 
+# The three embedded scripts below are read with `read -r -d ''`, not
+# `$(cat <<'X')`: the bash 3.2 that macOS ships as /bin/bash (which
+# `#!/usr/bin/env bash` often resolves to) mis-parses a here-document inside
+# $() — it scans for the closing ')' through the body, mangling backslash-
+# newlines and tripping on an unbalanced ')' (e.g. case patterns), which
+# corrupts the captured value or errors outright. A plain here-doc redirect
+# has no such bug.
+
 # Claude Code statusline, installed as /usr/local/bin/agentbox-statusline.
 # Line 1: ccusage (extra args are passed to it). Line 2: git project, branch,
 # linked worktree (if any), then the agentbox session name (as in PS1).
-statusline=$(cat <<'STATUSLINE'
+read -r -d '' statusline <<'STATUSLINE'
 #!/bin/sh
 in=$(cat)
 printf '%s\n' "$(printf '%s' "$in" | ccusage statusline "$@")"
@@ -54,13 +62,9 @@ fi
 [ -n "$AB_SESSION" ] && line="${line:+$line | }$(printf '\033[33m[%s]\033[0m' "$AB_SESSION")"
 [ -z "$line" ] || printf '%s\n' "$line"
 STATUSLINE
-)
 
 # Installed as /usr/local/bin/agentbox-boot; the entrypoint of every session:
 # install/update the agent ($AB_TOOL), then exec the given command (if any).
-# Read via `read -d ''`, not `$(cat <<'BOOT')`: bash 3.2 (the /bin/bash macOS
-# ships) mis-parses a here-doc inside $() when the body has an unbalanced ')',
-# such as the case patterns below, and closes the substitution early.
 read -r -d '' boot <<'BOOT'
 #!/bin/bash
 infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
@@ -91,7 +95,7 @@ fi
 BOOT
 : # `read -d ''` returns non-zero at EOF; keep the script's status clean
 
-dockerfile=$(cat <<'DOCKERFILE'
+read -r -d '' dockerfile <<'DOCKERFILE'
 FROM node:22-bookworm-slim
 ARG UID=1000
 ARG GID=1000
@@ -122,7 +126,6 @@ ENV PATH=/home/dev/.local/bin:/home/dev/.npm-global/bin:$PATH \
 RUN mkdir -p ~/.claude ~/.pi ~/.cursor ~/.config/cursor ~/.npm-global ~/.local/bin \
  && echo '[ -n "$AB_SESSION" ] && PS1="\\[\\e[33m\\][$AB_SESSION]\\[\\e[0m\\] $PS1"' >> ~/.bashrc
 DOCKERFILE
-)
 
 # Fingerprint of everything the build depends on, stored as an image label so a
 # stale image (e.g. after `brew upgrade agentbox`) is rebuilt automatically.
