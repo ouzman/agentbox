@@ -58,7 +58,10 @@ STATUSLINE
 
 # Installed as /usr/local/bin/agentbox-boot; the entrypoint of every session:
 # install/update the agent ($AB_TOOL), then exec the given command (if any).
-boot=$(cat <<'BOOT'
+# Read via `read -d ''`, not `$(cat <<'BOOT')`: bash 3.2 (the /bin/bash macOS
+# ships) mis-parses a here-doc inside $() when the body has an unbalanced ')',
+# such as the case patterns below, and closes the substitution early.
+read -r -d '' boot <<'BOOT'
 #!/bin/bash
 infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
 state="$HOME/.local/state/agentbox"; mkdir -p "$state"
@@ -86,7 +89,7 @@ elif [ -z "$(find "$stamp" -mmin -1440 2>/dev/null)" ]; then
 fi
 [ $# -eq 0 ] || exec "$@"
 BOOT
-)
+: # `read -d ''` returns non-zero at EOF; keep the script's status clean
 
 dockerfile=$(cat <<'DOCKERFILE'
 FROM node:22-bookworm-slim
